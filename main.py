@@ -12,9 +12,13 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.platform.message_session import MessageSession
 
 # 消息标签正则: [ref:xxxxxxxx]
 _TAG_PATTERN = re.compile(r"\[ref:([a-zA-Z0-9]+)\]")
+
+# send_by_session 未实现的平台（需要绕过直接使用客户端 API）
+_SEND_BY_SESSION_NOOP_PLATFORMS = {"weixin_official_account"}
 
 
 class MessageForwardPlugin(Star):
@@ -131,14 +135,13 @@ class MessageForwardPlugin(Star):
         forward_text = f"{prefix}{reply_text}"
 
         chain = MessageChain().message(forward_text)
-        try:
-            await self.context.send_message(user_umo, chain)
-            logger.info(f"引用回复已转发: {tag} → {user_umo}")
-        except Exception as e:
-            logger.error(f"引用回复转发失败: {e}")
-            yield event.plain_result(f"❌ 转发失败: {e}")
+        ok = await self._send_message(user_umo, chain)
+        if not ok:
+            logger.error(f"引用回复转发失败: {tag} → {user_umo}")
+            yield event.plain_result(f"❌ 转发失败，请稍后重试。")
             event.stop_event()
             return
+        logger.info(f"引用回复已转发: {tag} → {user_umo}")
 
         # 记录历史
         self._forward_history.append({
@@ -230,7 +233,7 @@ class MessageForwardPlugin(Star):
             notification_text = notify_template.format(ref_tag=tag)
             try:
                 notify_chain = MessageChain().message(notification_text)
-                await self.context.send_message(original_umo, notify_chain)
+                await self._send_message(original_umo, notify_chain)
             except Exception as e:
                 logger.error(f"发送用户通知失败: {e}")
 
@@ -284,11 +287,9 @@ class MessageForwardPlugin(Star):
             role = "管理员→指定会话"
 
         chain = MessageChain().message(message)
-        try:
-            await self.context.send_message(target_session, chain)
-        except Exception as e:
-            logger.error(f"forward_to_session 发送失败: {e}")
-            return f"消息发送失败: {e}"
+        ok = await self._send_message(target_session, chain)
+        if not ok:
+            return f"消息发送失败：无法发送到 {target_session}"
 
         logger.info(f"forward_to_session [{role}]: → {target_session}")
         return f"消息已发送到 {target_session}"
@@ -300,6 +301,50 @@ class MessageForwardPlugin(Star):
         raw = f"{time.time()}:{os.urandom(4).hex()}"
         hash_hex = hashlib.sha256(raw.encode()).hexdigest()[:8]
         return f"ref:{hash_hex}"
+
+    async def _send_message(self, session_str: str, message_chain: MessageChain) -> bool:
+        """发送消息到指定会话，自动处理平台差异。
+
+        部分平台（如微信公众号）的 send_by_session 是空实现，
+        需要绕过它直接使用平台客户端 API 发送。
+        """
+        try:
+            session = MessageSession.from_str(session_str)
+        except Exception as e:
+            logger.error(f"_send_message: 解析会话失败: {e}")
+            return False
+
+        platform_id = session.platform_id
+        if platform_id in _SEND_BY_SESSION_NOOP_PLATFORMS:
+            # 绕过空实现，直接使用平台客户端
+            platform = self.context.get_platform_inst(platform_id)
+            if not platform:
+                logger.error(f"_send_message: 未找到平台 {platform_id}")
+                return False
+            client = platform.get_client() if hasattr(platform, "get_client") else None
+            if not client:
+                logger.error(f"_send_message: 平台 {platform_id} 无可用客户端")
+                return False
+
+            target_user = session.session_id
+            for comp in message_chain.chain:
+                if isinstance(comp, Plain):
+                    try:
+                        client.message.send_text(target_user, comp.text)
+                        logger.info(f"_send_message: 通过客户端发送到 {platform_id}:{target_user}")
+                    except Exception as e:
+                        logger.error(f"_send_message: 客户端发送文本失败: {e}")
+                        return False
+                else:
+                    logger.warning(f"_send_message: 平台 {platform_id} 不支持组件类型 {type(comp).__name__}，已跳过")
+            return True
+
+        # 标准路径：使用 context.send_message
+        try:
+            return await self.context.send_message(session, message_chain)
+        except Exception as e:
+            logger.error(f"_send_message: context.send_message 失败: {e}")
+            return False
 
     def _get_admin_sessions(self) -> list[str]:
         """从配置中解析管理员会话列表（每行一个 unified_msg_origin）。"""
