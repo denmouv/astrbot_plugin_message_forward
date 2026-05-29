@@ -220,14 +220,19 @@ class MessageForwardPlugin(Star):
             except Exception as e:
                 logger.error(f"转发到管理员会话 {session_str} 失败: {e}")
 
-        # 通知用户
+        # 通知用户（通过 context.send_message 直接发送，不走 event pipeline）
+        notification_text = ""
         if self.config.get("enable_notification", True):
             notify_template = self.config.get(
                 "notification_message",
                 "您的问题已转接给人工客服处理，请耐心等待回复。（会话编号: {ref_tag}）",
             )
-            notify_msg = notify_template.format(ref_tag=tag)
-            yield event.plain_result(notify_msg)
+            notification_text = notify_template.format(ref_tag=tag)
+            try:
+                notify_chain = MessageChain().message(notification_text)
+                await self.context.send_message(original_umo, notify_chain)
+            except Exception as e:
+                logger.error(f"发送用户通知失败: {e}")
 
         # 记录历史
         self._forward_history.append({
