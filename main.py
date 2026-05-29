@@ -1,24 +1,373 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+import asyncio
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from typing import Dict
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Plain, Reply
+from astrbot.api.star import Context, Star, StarTools
+
+# 消息标签正则: [ref:xxxxxxxx]
+_TAG_PATTERN = re.compile(r"\[ref:([a-zA-Z0-9]+)\]")
+
+
+class MessageForwardPlugin(Star):
+    """消息转发助手插件（v2）
+
+    支持两种回复方式：
+    1. 引用回复 — 管理员长按消息→引用回复→自动转发给用户
+    2. Agent 工具 — 管理员侧 LLM 调用 forward_to_session 工具转发
+
+    无状态设计，通过消息标签 [ref:xxx] 关联管理员与其回复的用户。
+    """
+
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
+
+        # 数据目录
+        self._data_dir = StarTools.get_data_dir("astrbot_plugin_message_forward")
+        self._tags_file = self._data_dir / "message_tags.json"
+
+        # 消息标签 → 用户会话映射
+        # key: "ref:xxxxxxxx" → {"user_umo": "...", "user_name": "...", "created_at": timestamp}
+        self._message_tags: Dict[str, dict] = {}
+
+        # 转发历史（仅记录，不用于路由）
+        self._forward_history: list[dict] = []
+
+        # 文件读写锁
+        self._file_lock = asyncio.Lock()
+
+        # 后台清理任务
+        self._cleanup_task: asyncio.Task | None = None
+
+    # ==================== 生命周期 ====================
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        os.makedirs(self._data_dir, exist_ok=True)
+        await self._load_tags()
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        logger.info(f"消息转发插件 v2 已初始化，已加载 {len(self._message_tags)} 个消息标签")
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("消息转发插件 v2 已停用")
+
+    # ==================== 消息监听钩子：检测引用回复 ====================
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=sys.maxsize)
+    async def on_admin_message(self, event: AstrMessageEvent):
+        """拦截管理员会话中的引用回复消息，自动转发给用户。"""
+        admin_sessions = self._get_admin_sessions()
+        if not admin_sessions:
+            return
+
+        # 只处理管理员会话的消息
+        if event.unified_msg_origin not in admin_sessions:
+            return
+
+        # 跳过 Bot 自己发出的消息
+        if event.get_sender_id() == event.get_self_id():
+            return
+
+        # 检查消息是否包含 Reply 组件（引用回复）
+        messages = event.get_messages()
+        reply_comp = None
+        for comp in messages:
+            if isinstance(comp, Reply):
+                reply_comp = comp
+                break
+
+        if reply_comp is None:
+            # 不是引用回复，不拦截，让管理员 Bot 的 LLM 正常处理
+            return
+
+        # 从被引用的消息中提取标签
+        replied_text = reply_comp.message_str or ""
+        tag_match = _TAG_PATTERN.search(replied_text)
+        if not tag_match:
+            # 引用的消息中没有标签，不拦截
+            logger.info(f"引用回复中未找到消息标签，不触发转发。原文: {replied_text[:100]}")
+            return
+
+        tag = f"ref:{tag_match.group(1)}"
+        tag_data = self._message_tags.get(tag)
+        if not tag_data:
+            logger.info(f"消息标签 {tag} 已过期或不存在")
+            yield event.plain_result(f"⚠️ 该消息标签（{tag}）已过期或不存在，无法自动转发。请使用其他方式回复。")
+            event.stop_event()
+            return
+
+        # 提取管理员回复内容（排除 Reply 组件）
+        reply_text_parts = []
+        for comp in messages:
+            if isinstance(comp, Plain):
+                text = comp.text
+                if text:
+                    reply_text_parts.append(text)
+
+        reply_text = "".join(reply_text_parts).strip()
+        if not reply_text:
+            yield event.plain_result("⚠️ 回复内容为空，未转发。")
+            event.stop_event()
+            return
+
+        # 添加前缀并发送给用户
+        prefix = self.config.get("reply_prefix", "[管理员回复]\n")
+        user_umo = tag_data["user_umo"]
+        user_name = tag_data.get("user_name", "用户")
+        forward_text = f"{prefix}{reply_text}"
+
+        chain = MessageChain().message(forward_text)
+        try:
+            await self.context.send_message(user_umo, chain)
+            logger.info(f"引用回复已转发: {tag} → {user_umo}")
+        except Exception as e:
+            logger.error(f"引用回复转发失败: {e}")
+            yield event.plain_result(f"❌ 转发失败: {e}")
+            event.stop_event()
+            return
+
+        # 记录历史
+        self._forward_history.append({
+            "tag": tag,
+            "direction": "admin->user",
+            "user_umo": user_umo,
+            "user_name": user_name,
+            "admin_umo": event.unified_msg_origin,
+            "admin_name": event.get_sender_name(),
+            "content": reply_text,
+            "timestamp": datetime.now().isoformat(),
+        })
+        await self._trim_history()
+
+        # 给管理员确认
+        confirmation = self.config.get("reply_confirmation", "")
+        if confirmation:
+            confirm_msg = confirmation.format(user_name=user_name)
+            yield event.plain_result(confirm_msg)
+
+        # 阻止管理员 Bot 的 LLM 处理这条引用回复消息
+        event.stop_event()
+
+    # ==================== LLM 工具: forward_to_admin ====================
+
+    @filter.llm_tool(name="forward_to_admin")
+    async def forward_to_admin(self, event: AstrMessageEvent, reason: str, summary: str):
+        '''当 bot 无法回答用户的问题时，将问题转发给管理员处理。
+        仅当用户明确要求人工客服、或 bot 确实无法回答问题时才调用此工具。
+
+        Args:
+            reason(string): 转发原因，例如"无法回答技术问题"、"用户要求人工客服"
+            summary(string): 用户问题的简明摘要，概述用户的需求
+        '''
+        admin_sessions = self._get_admin_sessions()
+        if not admin_sessions:
+            logger.warning("forward_to_admin: 未配置管理员会话")
+            return "未配置管理员会话，无法转发。请联系管理员在插件配置中设置 admin_sessions。"
+
+        # 生成消息标签
+        tag = self._generate_tag()
+        original_umo = event.unified_msg_origin
+        original_msg = event.get_message_str()
+        sender_name = event.get_sender_name()
+        sender_id = event.get_sender_id()
+
+        # 存储标签映射
+        self._message_tags[tag] = {
+            "user_umo": original_umo,
+            "user_name": sender_name,
+            "user_sender_id": sender_id,
+            "created_at": time.time(),
+        }
+        await self._save_tags()
+
+        # 构建转发消息
+        header_template = self.config.get(
+            "forward_header",
+            "【消息转发】\n来自: {sender_name} ({sender_id})\n编号: {ref_tag}\n原因: {reason}\n--- 用户消息 ---",
+        )
+        forward_header = header_template.format(
+            sender_name=sender_name,
+            sender_id=sender_id,
+            ref_tag=tag,
+            reason=reason,
+        )
+        forward_msg = (
+            f"{forward_header}\n{original_msg}\n\n---\n"
+            f"💡 长按此消息→引用回复，回复内容将自动转发给用户。\n[{tag}]"
+        )
+
+        # 发送给所有管理员会话
+        chain = MessageChain().message(forward_msg)
+        success_count = 0
+        for session_str in admin_sessions:
+            try:
+                await self.context.send_message(session_str, chain)
+                success_count += 1
+            except Exception as e:
+                logger.error(f"转发到管理员会话 {session_str} 失败: {e}")
+
+        # 通知用户
+        if self.config.get("enable_notification", True):
+            notify_template = self.config.get(
+                "notification_message",
+                "您的问题已转接给人工客服处理，请耐心等待回复。（会话编号: {ref_tag}）",
+            )
+            notify_msg = notify_template.format(ref_tag=tag)
+            yield event.plain_result(notify_msg)
+
+        # 记录历史
+        self._forward_history.append({
+            "tag": tag,
+            "direction": "user->admin",
+            "user_umo": original_umo,
+            "user_name": sender_name,
+            "admin_umo": admin_sessions[0],
+            "reason": reason,
+            "summary": summary,
+            "original_message": original_msg,
+            "timestamp": datetime.now().isoformat(),
+        })
+        await self._trim_history()
+
+        if success_count > 0:
+            return (
+                f"消息已成功转发给管理员（编号: {tag}），已通知 {success_count} 个管理员会话。"
+                f"管理员可通过引用回复此消息来回复用户。"
+            )
+        else:
+            return "转发失败：无法发送消息给任何管理员会话，请检查管理员会话配置。"
+
+    # ==================== LLM 工具: forward_to_session（统一工具）====================
+
+    @filter.llm_tool(name="forward_to_session")
+    async def forward_to_session(self, event: AstrMessageEvent, target_session: str, message: str):
+        '''发送消息到指定会话。根据调用者身份区分行为：
+        - 非管理员调用：只能向管理员会话发送消息（客服场景）
+        - 管理员调用：可以向任意会话发送消息（管理员回复场景）
+
+        Args:
+            target_session(string): 目标会话的 unified_msg_origin，格式为 platform_id:message_type:session_id
+            message(string): 要发送的消息内容
+        '''
+        is_admin = event.unified_msg_origin in self._get_admin_sessions()
+        admin_sessions = self._get_admin_sessions()
+
+        if not is_admin:
+            # 非管理员调用：只能向管理员发送
+            if target_session not in admin_sessions:
+                available = "\n".join(admin_sessions) if admin_sessions else "（未配置）"
+                return (
+                    f"您只能向管理员发送消息。可用的管理员会话:\n{available}"
+                )
+            role = "用户→管理员"
+        else:
+            # 管理员调用：无限制
+            role = "管理员→指定会话"
+
+        chain = MessageChain().message(message)
+        try:
+            await self.context.send_message(target_session, chain)
+        except Exception as e:
+            logger.error(f"forward_to_session 发送失败: {e}")
+            return f"消息发送失败: {e}"
+
+        logger.info(f"forward_to_session [{role}]: → {target_session}")
+        return f"消息已发送到 {target_session}"
+
+    # ==================== 消息标签管理 ====================
+
+    def _generate_tag(self) -> str:
+        """生成唯一消息标签: ref:xxxxxxxx"""
+        raw = f"{time.time()}:{os.urandom(4).hex()}"
+        hash_hex = hashlib.sha256(raw.encode()).hexdigest()[:8]
+        return f"ref:{hash_hex}"
+
+    def _get_admin_sessions(self) -> list[str]:
+        """从配置中解析管理员会话列表（每行一个 unified_msg_origin）。"""
+        text = self.config.get("admin_sessions", "")
+        if not text or not text.strip():
+            return []
+        return [line.strip() for line in text.strip().split("\n") if line.strip()]
+
+    # ==================== 持久化 ====================
+
+    async def _load_tags(self):
+        """从 JSON 文件加载消息标签和历史。"""
+        async with self._file_lock:
+            try:
+                if os.path.exists(self._tags_file):
+                    with open(self._tags_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    self._message_tags = data.get("tags", {})
+                    self._forward_history = data.get("history", [])
+                    logger.info(
+                        f"已加载 {len(self._message_tags)} 个标签，"
+                        f"{len(self._forward_history)} 条历史记录"
+                    )
+            except Exception as e:
+                logger.error(f"加载数据失败: {e}")
+                self._message_tags = {}
+                self._forward_history = []
+
+    async def _save_tags(self):
+        """将消息标签和历史持久化到 JSON 文件。"""
+        async with self._file_lock:
+            try:
+                data = {
+                    "tags": self._message_tags,
+                    "history": self._forward_history,
+                }
+                with open(self._tags_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"保存数据失败: {e}")
+
+    async def _trim_history(self):
+        """裁剪历史记录，保留最近 max_history 条。"""
+        max_history = self.config.get("max_history", 500)
+        if len(self._forward_history) > max_history:
+            self._forward_history = self._forward_history[-max_history:]
+            await self._save_tags()
+
+    # ==================== 过期标签清理 ====================
+
+    async def _cleanup_loop(self):
+        """后台定期清理过期标签。"""
+        while True:
+            try:
+                await asyncio.sleep(3600)  # 每小时检查一次
+                expire_hours = self.config.get("tag_expire_hours", 72)
+                if expire_hours <= 0:
+                    continue
+
+                now = time.time()
+                expired = []
+                for tag, data in self._message_tags.items():
+                    age_hours = (now - data.get("created_at", 0)) / 3600
+                    if age_hours > expire_hours:
+                        expired.append(tag)
+
+                if expired:
+                    for tag in expired:
+                        del self._message_tags[tag]
+                    await self._save_tags()
+                    logger.info(f"已清理 {len(expired)} 个过期标签")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"标签清理出错: {e}")
+                await asyncio.sleep(60)

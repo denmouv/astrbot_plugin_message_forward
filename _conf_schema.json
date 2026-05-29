@@ -1,0 +1,50 @@
+{
+  "admin_sessions": {
+    "type": "text",
+    "description": "管理员会话列表（每行一个 unified_msg_origin）",
+    "hint": "格式: platform_id:message_type:session_id，例如 weixin_oc:FriendMessage:wxid_xxx。每行一个。管理员的引用回复将自动转发给用户。",
+    "default": ""
+  },
+  "enable_notification": {
+    "type": "bool",
+    "description": "转发后通知原用户",
+    "hint": "开启后，当消息被转发给管理员时，会通知原用户其问题已转接。",
+    "default": true
+  },
+  "notification_message": {
+    "type": "text",
+    "description": "用户通知消息模板",
+    "hint": "发送给原用户的提示消息。支持占位符: {ref_tag}。",
+    "default": "您的问题已转接给人工客服处理，请耐心等待回复。（会话编号: {ref_tag}）"
+  },
+  "forward_header": {
+    "type": "text",
+    "description": "转发消息头部模板（发送给管理员）",
+    "hint": "支持占位符: {sender_name}, {sender_id}, {ref_tag}, {reason}。",
+    "default": "【消息转发】\n来自: {sender_name} ({sender_id})\n编号: {ref_tag}\n原因: {reason}\n--- 用户消息 ---"
+  },
+  "reply_prefix": {
+    "type": "text",
+    "description": "管理员回复前缀（发送给用户时添加）",
+    "hint": "留空则不添加前缀。",
+    "default": "[管理员回复]\n"
+  },
+  "reply_confirmation": {
+    "type": "text",
+    "description": "转发确认消息（发送给管理员，引用回复后）",
+    "hint": "支持占位符: {user_name}。留空则不发送确认。",
+    "default": "[已转发给 {user_name}]"
+  },
+  "tag_expire_hours": {
+    "type": "int",
+    "description": "消息标签过期时间（小时）",
+    "hint": "超过此时间后，通过引用回复将无法找到对应的用户会话。设为 0 表示永不过期。",
+    "default": 72
+  },
+  "max_history": {
+    "type": "int",
+    "description": "最大历史记录数",
+    "hint": "超过此数量后，最早的记录会被清理。",
+    "default": 500
+  }
+}
