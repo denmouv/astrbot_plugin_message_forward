@@ -20,8 +20,8 @@
   "forward_header": {
     "type": "text",
     "description": "转发消息头部模板（发送给管理员）",
-    "hint": "支持占位符: {sender_name}, {sender_id}, {ref_tag}, {reason}。",
-    "default": "【消息转发】\n来自: {sender_name} ({sender_id})\n编号: {ref_tag}\n原因: {reason}\n--- 用户消息 ---"
+    "hint": "支持 Markdown。占位符: {sender_name}, {sender_id}, {ref_tag}, {reason}。",
+    "default": "> 用户 {sender_name}\n> 原因 {reason}\n> 编号 `{ref_tag}`"
   },
   "reply_prefix": {
     "type": "text",
