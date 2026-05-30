@@ -95,13 +95,22 @@ class MessageForwardPlugin(Star):
             if not user_msg.strip():
                 return
 
+            # 生成新标签，管理员可引用此消息回复
+            tag = self._generate_tag()
+            self._message_tags[tag] = {
+                "user_umo": user_umo,
+                "user_name": event.get_sender_name(),
+                "created_at": time.time(),
+            }
+            await self._save_tags()
+
             admin_umo = manual["admin_umo"]
             forward_text = (
                 f"💬 用户消息\n"
                 f"---\n"
                 f"{user_msg}\n"
                 f"---\n"
-                f"💡 引用此消息回复"
+                f"💡 引用此消息回复\n[{tag}]"
             )
             chain = MessageChain().message(forward_text)
             try:
