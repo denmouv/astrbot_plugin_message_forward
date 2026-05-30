@@ -228,14 +228,13 @@ class MessageForwardPlugin(Star):
         sender_name = event.get_sender_name()
         tag = await self._create_tag(original_umo, sender_name)
 
-        # 构建转发消息（用 summary 作为主体，原始消息引用在下方）
-        msg_body = summary if summary else original_msg[:200]
+        # 构建转发消息
         forward_msg = (
-            f"📨 转人工 · `{tag}`\n"
+            f"📨 转人工\n"
             f"---\n"
-            f"{msg_body}\n"
+            f"用户问题摘要: {summary}\n\n"
+            f"用户原消息: {original_msg}\n"
             f"---\n"
-            f"> 原消息: {original_msg[:200]}\n"
             f"💡 引用此消息回复 `{tag}`"
         )
 
