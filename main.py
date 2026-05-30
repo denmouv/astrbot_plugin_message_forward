@@ -70,24 +70,55 @@ class MessageForwardPlugin(Star):
                 pass
         logger.info("消息转发插件 v2 已停用")
 
-    # ==================== 消息监听钩子：检测引用回复 ====================
+    # ==================== 消息拦截钩子（管理员引用回复 + 用户手动模式）====================
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=sys.maxsize)
-    async def on_admin_message(self, event: AstrMessageEvent):
-        """拦截管理员会话中的引用回复消息，自动转发给用户。"""
-        admin_sessions = self._get_admin_sessions()
-        if not admin_sessions:
-            return
-
-        # 只处理管理员会话的消息
-        if event.unified_msg_origin not in admin_sessions:
-            return
-
+    async def on_message_intercept(self, event: AstrMessageEvent):
+        """统一消息拦截：管理员引用回复转发 + 手动模式用户消息转发。"""
         # 跳过 Bot 自己发出的消息
         if event.get_sender_id() == event.get_self_id():
             return
 
-        # 检查消息是否包含 Reply 组件（引用回复）
+        user_umo = event.unified_msg_origin
+        admin_sessions = self._get_admin_sessions()
+
+        # ---- 分支 1: 手动模式用户消息 → 转发给管理员 ----
+        manual = self._manual_sessions.get(user_umo)
+        if manual is not None:
+            now = time.time()
+            if now >= manual["expires_at"]:
+                del self._manual_sessions[user_umo]
+                logger.info(f"手动模式已超时退出: {user_umo}")
+                return
+
+            user_msg = event.get_message_str()
+            if not user_msg.strip():
+                return
+
+            admin_umo = manual["admin_umo"]
+            forward_text = (
+                f"💬 用户消息\n"
+                f"---\n"
+                f"{user_msg}\n"
+                f"---\n"
+                f"💡 引用此消息回复"
+            )
+            chain = MessageChain().message(forward_text)
+            try:
+                await self.context.send_message(admin_umo, chain)
+                logger.info(f"手动模式转发: {user_umo} → {admin_umo}")
+            except Exception as e:
+                logger.error(f"手动模式转发失败: {e}")
+
+            manual["expires_at"] = now + 3600
+            event.stop_event()
+            return
+
+        # ---- 分支 2: 非管理员会话 → 不处理 ----
+        if not admin_sessions or user_umo not in admin_sessions:
+            return
+
+        # ---- 分支 3: 管理员引用回复 → 转发给用户 ----
         messages = event.get_messages()
         reply_comp = None
         for comp in messages:
@@ -96,14 +127,13 @@ class MessageForwardPlugin(Star):
                 break
 
         if reply_comp is None:
-            # 不是引用回复，不拦截，让管理员 Bot 的 LLM 正常处理
+            # 不是引用回复，让管理员 Bot 的 LLM 正常处理
             return
 
         # 从被引用的消息中提取标签
         replied_text = reply_comp.message_str or ""
         tag_match = _TAG_PATTERN.search(replied_text)
         if not tag_match:
-            # 引用的消息中没有标签，不拦截
             logger.info(f"引用回复中未找到消息标签，不触发转发。原文: {replied_text[:100]}")
             return
 
@@ -129,98 +159,46 @@ class MessageForwardPlugin(Star):
             event.stop_event()
             return
 
-        # 添加前缀并发送给用户
+        # 发送给用户
         prefix = self.config.get("reply_prefix", "[管理员回复]\n")
-        user_umo = tag_data["user_umo"]
+        target_umo = tag_data["user_umo"]
         user_name = tag_data.get("user_name", "用户")
         forward_text = f"{prefix}{reply_text}"
 
         chain = MessageChain().message(forward_text)
-        ok = await self._send_message(user_umo, chain)
+        ok = await self._send_message(target_umo, chain)
         if not ok:
-            logger.error(f"引用回复转发失败: {tag} → {user_umo}")
+            logger.error(f"引用回复转发失败: {tag} → {target_umo}")
             yield event.plain_result(f"❌ 转发失败，请稍后重试。")
             event.stop_event()
             return
-        logger.info(f"引用回复已转发: {tag} → {user_umo}")
+        logger.info(f"引用回复已转发: {tag} → {target_umo}")
 
-        # 注入到用户对话历史（管理员回复作为 assistant 消息，让用户侧 LLM 感知）
-        await self._inject_to_conversation(user_umo, "assistant", forward_text)
-
-        # 注入到管理员对话历史（管理员消息作为 user，确认作为 assistant）
-        admin_umo = event.unified_msg_origin
-        await self._inject_to_conversation(admin_umo, "user", reply_text)
+        # 注入对话历史
+        await self._inject_to_conversation(target_umo, "assistant", forward_text)
+        await self._inject_to_conversation(user_umo, "user", reply_text)
         confirmation = self.config.get("reply_confirmation", "")
         if confirmation:
             confirm_msg = confirmation.format(user_name=user_name)
-            await self._inject_to_conversation(admin_umo, "assistant", confirm_msg)
+            await self._inject_to_conversation(user_umo, "assistant", confirm_msg)
 
         # 记录历史
         self._forward_history.append({
             "tag": tag,
             "direction": "admin->user",
-            "user_umo": user_umo,
+            "user_umo": target_umo,
             "user_name": user_name,
-            "admin_umo": admin_umo,
+            "admin_umo": user_umo,
             "admin_name": event.get_sender_name(),
             "content": reply_text,
             "timestamp": datetime.now().isoformat(),
         })
         await self._trim_history()
 
-        # 给管理员确认（yield 回复，让 Bot B 显示确认文本）
-        confirmation = self.config.get("reply_confirmation", "")
         if confirmation:
             confirm_msg = confirmation.format(user_name=user_name)
             yield event.plain_result(confirm_msg)
 
-        # 阻止管理员 Bot 的 LLM 处理这条引用回复消息
-        event.stop_event()
-
-    # ==================== 用户侧手动模式拦截 ====================
-
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=sys.maxsize - 1)
-    async def on_user_manual_mode(self, event: AstrMessageEvent):
-        """已进入手动模式的用户会话，消息直接转发给管理员，不调 LLM。"""
-        user_umo = event.unified_msg_origin
-        manual = self._manual_sessions.get(user_umo)
-        if manual is None:
-            return
-
-        now = time.time()
-        if now >= manual["expires_at"]:
-            del self._manual_sessions[user_umo]
-            logger.info(f"手动模式已超时退出: {user_umo}")
-            return
-
-        # 跳过 Bot 自己发出的消息
-        if event.get_sender_id() == event.get_self_id():
-            return
-
-        # 转发用户消息给管理员
-        user_msg = event.get_message_str()
-        if not user_msg.strip():
-            return
-
-        admin_umo = manual["admin_umo"]
-        forward_text = (
-            f"💬 用户消息\n"
-            f"---\n"
-            f"{user_msg}\n"
-            f"---\n"
-            f"💡 引用此消息回复"
-        )
-        chain = MessageChain().message(forward_text)
-        try:
-            await self.context.send_message(admin_umo, chain)
-            logger.info(f"手动模式转发: {user_umo} → {admin_umo}")
-        except Exception as e:
-            logger.error(f"手动模式转发失败: {e}")
-
-        # 重置超时为 1h
-        manual["expires_at"] = now + 3600
-
-        # 阻止 LLM 处理
         event.stop_event()
 
     # ==================== LLM 工具: forward_to_admin ====================
