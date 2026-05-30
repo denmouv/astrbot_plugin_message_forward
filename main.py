@@ -186,6 +186,12 @@ class MessageForwardPlugin(Star):
         """已进入手动模式的用户会话，消息直接转发给管理员，不调 LLM。"""
         user_umo = event.unified_msg_origin
         manual = self._manual_sessions.get(user_umo)
+        # DEBUG: 确认钩子触发和 key 匹配情况
+        logger.info(
+            f"on_user_manual_mode: umo={user_umo}, "
+            f"in_manual={user_umo in self._manual_sessions}, "
+            f"manual_keys={list(self._manual_sessions.keys())}"
+        )
         if manual is None:
             return
 
