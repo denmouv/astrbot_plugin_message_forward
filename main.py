@@ -46,6 +46,9 @@ class MessageForwardPlugin(Star):
         # 转发历史（仅记录，不用于路由）
         self._forward_history: list[dict] = []
 
+        # 手动模式会话: user_umo → {"admin_umo": "...", "expires_at": timestamp}
+        self._manual_sessions: Dict[str, dict] = {}
+
         # 文件读写锁
         self._file_lock = asyncio.Lock()
 
@@ -176,6 +179,54 @@ class MessageForwardPlugin(Star):
         # 阻止管理员 Bot 的 LLM 处理这条引用回复消息
         event.stop_event()
 
+    # ==================== 用户侧手动模式拦截 ====================
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=sys.maxsize - 1)
+    async def on_user_manual_mode(self, event: AstrMessageEvent):
+        """已进入手动模式的用户会话，消息直接转发给管理员，不调 LLM。"""
+        user_umo = event.unified_msg_origin
+        manual = self._manual_sessions.get(user_umo)
+        if manual is None:
+            return
+
+        now = time.time()
+        if now >= manual["expires_at"]:
+            del self._manual_sessions[user_umo]
+            logger.info(f"手动模式已超时退出: {user_umo}")
+            return
+
+        # 跳过 Bot 自己发出的消息
+        if event.get_sender_id() == event.get_self_id():
+            return
+
+        # 转发用户消息给管理员
+        user_msg = event.get_message_str()
+        if not user_msg.strip():
+            return
+
+        admin_umo = manual["admin_umo"]
+        forward_text = (
+            f"【用户消息】\n"
+            f"来自: {event.get_sender_name()} ({user_umo})\n"
+            f"{user_msg}\n\n"
+            f"💡 长按此消息→引用回复，即可回复用户。"
+        )
+        chain = MessageChain().message(forward_text)
+        try:
+            await self.context.send_message(admin_umo, chain)
+            logger.info(f"手动模式转发: {user_umo} → {admin_umo}")
+        except Exception as e:
+            logger.error(f"手动模式转发失败: {e}")
+
+        # 重置超时为 1h
+        manual["expires_at"] = now + 3600
+
+        # 告知用户
+        yield event.plain_result("已转接人工客服处理中，请耐心等待。")
+
+        # 阻止 LLM 处理
+        event.stop_event()
+
     # ==================== LLM 工具: forward_to_admin ====================
 
     @filter.llm_tool(name="forward_to_admin")
@@ -263,6 +314,11 @@ class MessageForwardPlugin(Star):
         await self._trim_history()
 
         if success_count > 0:
+            # 标记用户进入手动模式，后续消息直接转发管理员
+            self._manual_sessions[original_umo] = {
+                "admin_umo": admin_sessions[0],
+                "expires_at": time.time() + 48 * 3600,
+            }
             return (
                 f"消息已成功转发给管理员（编号: {tag}），已通知 {success_count} 个管理员会话。"
                 f"管理员可通过引用回复此消息来回复用户。"
@@ -463,6 +519,16 @@ class MessageForwardPlugin(Star):
                         del self._message_tags[tag]
                     await self._save_tags()
                     logger.info(f"已清理 {len(expired)} 个过期标签")
+
+                # 清理过期的手动模式会话
+                expired_manual = [
+                    umo for umo, data in self._manual_sessions.items()
+                    if now >= data["expires_at"]
+                ]
+                for umo in expired_manual:
+                    del self._manual_sessions[umo]
+                if expired_manual:
+                    logger.info(f"已清理 {len(expired_manual)} 个过期手动模式会话")
             except asyncio.CancelledError:
                 break
             except Exception as e:
