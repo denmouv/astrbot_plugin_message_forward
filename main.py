@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -96,13 +95,7 @@ class MessageForwardPlugin(Star):
                 return
 
             # 生成新标签，管理员可引用此消息回复
-            tag = self._generate_tag()
-            self._message_tags[tag] = {
-                "user_umo": user_umo,
-                "user_name": event.get_sender_name(),
-                "created_at": time.time(),
-            }
-            await self._save_tags()
+            tag = await self._create_tag(user_umo, event.get_sender_name())
 
             admin_umo = manual["admin_umo"]
             forward_text = (
@@ -118,6 +111,9 @@ class MessageForwardPlugin(Star):
                 logger.info(f"手动模式转发: {user_umo} → {admin_umo}")
             except Exception as e:
                 logger.error(f"手动模式转发失败: {e}")
+
+            # 注入到用户对话历史（记录用户说了什么）
+            await self._inject_to_conversation(user_umo, "user", user_msg)
 
             manual["expires_at"] = now + 3600
             event.stop_event()
@@ -227,27 +223,19 @@ class MessageForwardPlugin(Star):
             return "未配置管理员会话，无法转发。请联系管理员在插件配置中设置 admin_sessions。"
 
         # 生成消息标签
-        tag = self._generate_tag()
         original_umo = event.unified_msg_origin
         original_msg = event.get_message_str()
         sender_name = event.get_sender_name()
-        sender_id = event.get_sender_id()
+        tag = await self._create_tag(original_umo, sender_name)
 
-        # 存储标签映射
-        self._message_tags[tag] = {
-            "user_umo": original_umo,
-            "user_name": sender_name,
-            "user_sender_id": sender_id,
-            "created_at": time.time(),
-        }
-        await self._save_tags()
-
-        # 构建转发消息
+        # 构建转发消息（用 summary 作为主体，原始消息引用在下方）
+        msg_body = summary if summary else original_msg[:200]
         forward_msg = (
             f"📨 转人工 · `{tag}`\n"
             f"---\n"
-            f"{original_msg}\n"
+            f"{msg_body}\n"
             f"---\n"
+            f"> 原消息: {original_msg[:200]}\n"
             f"💡 引用此消息回复\n[{tag}]"
         )
 
@@ -261,16 +249,15 @@ class MessageForwardPlugin(Star):
             except Exception as e:
                 logger.error(f"转发到管理员会话 {session_str} 失败: {e}")
 
-        # 通知用户（通过 context.send_message 直接发送，不走 event pipeline）
-        notification_text = ""
+        # 通知用户
         if self.config.get("enable_notification", True):
             notify_template = self.config.get(
                 "notification_message",
                 "您的问题已转接给人工客服处理，请耐心等待回复。（会话编号: {ref_tag}）",
             )
-            notification_text = notify_template.format(ref_tag=tag)
+            notify_text = notify_template.format(ref_tag=tag)
             try:
-                notify_chain = MessageChain().message(notification_text)
+                notify_chain = MessageChain().message(notify_text)
                 await self._send_message(original_umo, notify_chain)
             except Exception as e:
                 logger.error(f"发送用户通知失败: {e}")
@@ -306,9 +293,18 @@ class MessageForwardPlugin(Star):
 
     def _generate_tag(self) -> str:
         """生成唯一消息标签: ref:xxxxxxxx"""
-        raw = f"{time.time()}:{os.urandom(4).hex()}"
-        hash_hex = hashlib.sha256(raw.encode()).hexdigest()[:8]
-        return f"ref:{hash_hex}"
+        return f"ref:{os.urandom(4).hex()}{int(time.time() * 1000) % 10000:04d}"
+
+    async def _create_tag(self, user_umo: str, user_name: str) -> str:
+        """生成标签并存储映射。返回标签字符串。"""
+        tag = self._generate_tag()
+        self._message_tags[tag] = {
+            "user_umo": user_umo,
+            "user_name": user_name,
+            "created_at": time.time(),
+        }
+        await self._save_tags()
+        return tag
 
     async def _send_message(self, session_str: str, message_chain: MessageChain) -> bool:
         """发送消息到指定会话，自动处理平台差异。
