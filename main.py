@@ -204,10 +204,9 @@ class MessageForwardPlugin(Star):
 
         admin_umo = manual["admin_umo"]
         forward_text = (
-            f"**💬 用户消息**\n"
+            f"💬 用户\n\n"
             f"{user_msg}\n\n"
-            f"> 来自 {event.get_sender_name()}\n"
-            f"💡 引用此消息即可回复"
+            f"💡 引用此消息回复"
         )
         chain = MessageChain().message(forward_text)
         try:
@@ -255,21 +254,10 @@ class MessageForwardPlugin(Star):
         await self._save_tags()
 
         # 构建转发消息
-        header_template = self.config.get(
-            "forward_header",
-            "> 用户 {sender_name}\n> 原因 {reason}\n> 编号 `{ref_tag}`",
-        )
-        forward_header = header_template.format(
-            sender_name=sender_name,
-            sender_id=sender_id,
-            ref_tag=tag,
-            reason=reason,
-        )
         forward_msg = (
-            f"**📨 新转接**\n"
-            f"{forward_header}\n\n"
+            f"📨 转人工 · `{tag}`\n\n"
             f"{original_msg}\n\n"
-            f"💡 引用此消息即可回复\n[{tag}]"
+            f"💡 引用此消息回复\n[{tag}]"
         )
 
         # 发送给所有管理员会话

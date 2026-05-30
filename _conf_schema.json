@@ -17,12 +17,6 @@
     "hint": "发送给原用户的提示消息。支持占位符: {ref_tag}。",
     "default": "您的问题已转接给人工客服处理，请耐心等待回复。（会话编号: {ref_tag}）"
   },
-  "forward_header": {
-    "type": "text",
-    "description": "转发消息头部模板（发送给管理员）",
-    "hint": "支持 Markdown。占位符: {sender_name}, {sender_id}, {ref_tag}, {reason}。",
-    "default": "> 用户 {sender_name}\n> 原因 {reason}\n> 编号 `{ref_tag}`"
-  },
   "reply_prefix": {
     "type": "text",
     "description": "管理员回复前缀（发送给用户时添加）",
