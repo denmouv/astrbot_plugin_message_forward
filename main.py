@@ -219,9 +219,6 @@ class MessageForwardPlugin(Star):
         # 重置超时为 1h
         manual["expires_at"] = now + 3600
 
-        # 告知用户
-        yield event.plain_result("已转接人工客服处理中，请耐心等待。")
-
         # 阻止 LLM 处理
         event.stop_event()
 
