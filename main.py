@@ -24,9 +24,7 @@ _SEND_BY_SESSION_NOOP_PLATFORMS = {"weixin_official_account"}
 class MessageForwardPlugin(Star):
     """消息转发助手插件（v2）
 
-    支持两种回复方式：
-    1. 引用回复 — 管理员长按消息→引用回复→自动转发给用户
-    2. Agent 工具 — 管理员侧 LLM 调用 forward_to_session 工具转发
+    管理员通过长按消息→引用回复，回复内容自动转发给用户。
 
     无状态设计，通过消息标签 [ref:xxx] 关联管理员与其回复的用户。
     """
@@ -186,12 +184,6 @@ class MessageForwardPlugin(Star):
         """已进入手动模式的用户会话，消息直接转发给管理员，不调 LLM。"""
         user_umo = event.unified_msg_origin
         manual = self._manual_sessions.get(user_umo)
-        # DEBUG: 确认钩子触发和 key 匹配情况
-        logger.info(
-            f"on_user_manual_mode: umo={user_umo}, "
-            f"in_manual={user_umo in self._manual_sessions}, "
-            f"manual_keys={list(self._manual_sessions.keys())}"
-        )
         if manual is None:
             return
 
@@ -331,53 +323,6 @@ class MessageForwardPlugin(Star):
             )
         else:
             return "转发失败：无法发送消息给任何管理员会话，请检查管理员会话配置。"
-
-    # ==================== LLM 工具: forward_to_session（统一工具）====================
-
-    @filter.llm_tool(name="forward_to_session")
-    async def forward_to_session(self, event: AstrMessageEvent, target_session: str, message: str):
-        '''发送消息到指定会话。根据调用者身份区分行为：
-        - 非管理员调用：只能向管理员会话发送消息（客服场景）
-        - 管理员调用：可以向任意会话发送消息（管理员回复场景）
-
-        Args:
-            target_session(string): 目标会话的 unified_msg_origin，格式为 platform_id:message_type:session_id
-            message(string): 要发送的消息内容
-        '''
-        is_admin = event.unified_msg_origin in self._get_admin_sessions()
-        admin_sessions = self._get_admin_sessions()
-
-        if not is_admin:
-            # 非管理员调用：只能向管理员发送
-            if target_session not in admin_sessions:
-                available = "\n".join(admin_sessions) if admin_sessions else "（未配置）"
-                return (
-                    f"您只能向管理员发送消息。可用的管理员会话:\n{available}"
-                )
-            role = "用户→管理员"
-        else:
-            # 管理员调用：无限制
-            role = "管理员→指定会话"
-
-        chain = MessageChain().message(message)
-        ok = await self._send_message(target_session, chain)
-        if not ok:
-            return f"消息发送失败：无法发送到 {target_session}"
-
-        # 注入到目标会话的对话历史
-        await self._inject_to_conversation(target_session, "assistant", message)
-
-        # 注入到调用方会话的对话历史（记录发送行为）
-        caller_umo = event.unified_msg_origin
-        if is_admin:
-            # 管理员侧：记录用户消息（管理员说"回复xxx"）和管理员回复
-            await self._inject_to_conversation(caller_umo, "assistant", f"已发送到用户: {message}")
-        else:
-            # 用户侧：记录用户触发的转发
-            await self._inject_to_conversation(caller_umo, "user", f"用户消息: {event.get_message_str()}")
-
-        logger.info(f"forward_to_session [{role}]: → {target_session}")
-        return f"消息已发送到 {target_session}"
 
     # ==================== 消息标签管理 ====================
 
