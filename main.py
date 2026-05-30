@@ -14,7 +14,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.platform.message_session import MessageSession
 
 # 消息标签正则: [ref:xxxxxxxx]
-_TAG_PATTERN = re.compile(r"\[ref:([a-zA-Z0-9]+)\]")
+_TAG_PATTERN = re.compile(r"`ref:([a-zA-Z0-9]+)`")
 
 # send_by_session 未实现的平台（需要绕过直接使用客户端 API）
 _SEND_BY_SESSION_NOOP_PLATFORMS = {"weixin_official_account"}
@@ -103,7 +103,7 @@ class MessageForwardPlugin(Star):
                 f"---\n"
                 f"{user_msg}\n"
                 f"---\n"
-                f"💡 引用此消息回复\n[{tag}]"
+                f"💡 引用此消息回复 `{tag}`"
             )
             chain = MessageChain().message(forward_text)
             try:
@@ -236,7 +236,7 @@ class MessageForwardPlugin(Star):
             f"{msg_body}\n"
             f"---\n"
             f"> 原消息: {original_msg[:200]}\n"
-            f"💡 引用此消息回复\n[{tag}]"
+            f"💡 引用此消息回复 `{tag}`"
         )
 
         # 发送给所有管理员会话
