@@ -204,8 +204,10 @@ class MessageForwardPlugin(Star):
 
         admin_umo = manual["admin_umo"]
         forward_text = (
-            f"💬 用户\n\n"
-            f"{user_msg}\n\n"
+            f"💬 用户消息\n"
+            f"---\n"
+            f"{user_msg}\n"
+            f"---\n"
             f"💡 引用此消息回复"
         )
         chain = MessageChain().message(forward_text)
@@ -255,8 +257,10 @@ class MessageForwardPlugin(Star):
 
         # 构建转发消息
         forward_msg = (
-            f"📨 转人工 · `{tag}`\n\n"
-            f"{original_msg}\n\n"
+            f"📨 转人工 · `{tag}`\n"
+            f"---\n"
+            f"{original_msg}\n"
+            f"---\n"
             f"💡 引用此消息回复\n[{tag}]"
         )
 
