@@ -143,20 +143,31 @@ class MessageForwardPlugin(Star):
             return
         logger.info(f"引用回复已转发: {tag} → {user_umo}")
 
+        # 注入到用户对话历史（管理员回复作为 assistant 消息，让用户侧 LLM 感知）
+        await self._inject_to_conversation(user_umo, "assistant", forward_text)
+
+        # 注入到管理员对话历史（管理员消息作为 user，确认作为 assistant）
+        admin_umo = event.unified_msg_origin
+        await self._inject_to_conversation(admin_umo, "user", reply_text)
+        confirmation = self.config.get("reply_confirmation", "")
+        if confirmation:
+            confirm_msg = confirmation.format(user_name=user_name)
+            await self._inject_to_conversation(admin_umo, "assistant", confirm_msg)
+
         # 记录历史
         self._forward_history.append({
             "tag": tag,
             "direction": "admin->user",
             "user_umo": user_umo,
             "user_name": user_name,
-            "admin_umo": event.unified_msg_origin,
+            "admin_umo": admin_umo,
             "admin_name": event.get_sender_name(),
             "content": reply_text,
             "timestamp": datetime.now().isoformat(),
         })
         await self._trim_history()
 
-        # 给管理员确认
+        # 给管理员确认（yield 回复，让 Bot B 显示确认文本）
         confirmation = self.config.get("reply_confirmation", "")
         if confirmation:
             confirm_msg = confirmation.format(user_name=user_name)
@@ -291,6 +302,18 @@ class MessageForwardPlugin(Star):
         if not ok:
             return f"消息发送失败：无法发送到 {target_session}"
 
+        # 注入到目标会话的对话历史
+        await self._inject_to_conversation(target_session, "assistant", message)
+
+        # 注入到调用方会话的对话历史（记录发送行为）
+        caller_umo = event.unified_msg_origin
+        if is_admin:
+            # 管理员侧：记录用户消息（管理员说"回复xxx"）和管理员回复
+            await self._inject_to_conversation(caller_umo, "assistant", f"已发送到用户: {message}")
+        else:
+            # 用户侧：记录用户触发的转发
+            await self._inject_to_conversation(caller_umo, "user", f"用户消息: {event.get_message_str()}")
+
         logger.info(f"forward_to_session [{role}]: → {target_session}")
         return f"消息已发送到 {target_session}"
 
@@ -352,6 +375,30 @@ class MessageForwardPlugin(Star):
         if not text or not text.strip():
             return []
         return [line.strip() for line in text.strip().split("\n") if line.strip()]
+
+    async def _inject_to_conversation(self, umo: str, role: str, content: str) -> bool:
+        """将一条消息注入到指定会话的 LLM 对话历史中。
+
+        解决管理员通过插件回复用户时，回复内容只走了平台推送、
+        没有写入 ConversationManager 导致 LLM 上下文缺失的问题。
+        """
+        try:
+            conv_mgr = self.context.conversation_manager
+            cid = await conv_mgr.get_curr_conversation_id(umo)
+            if not cid:
+                logger.debug(f"_inject_to_conversation: {umo} 没有活跃对话，跳过")
+                return False
+            conv = await conv_mgr.get_conversation(umo, cid)
+            if not conv:
+                return False
+            history = json.loads(conv.history) if conv.history else []
+            history.append({"role": role, "content": content})
+            await conv_mgr.update_conversation(umo, cid, history=history)
+            logger.info(f"已注入消息到 {umo} 对话历史: [{role}] {content[:60]}...")
+            return True
+        except Exception as e:
+            logger.error(f"注入对话历史失败 ({umo}): {e}")
+            return False
 
     # ==================== 持久化 ====================
 
